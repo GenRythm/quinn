@@ -28,9 +28,9 @@ pub mod server;
 mod frame;
 mod streams;
 
-use quinn::WriteError;
-
 use err_derive::Error;
+use quinn::{ReadError, WriteError};
+use std::io::ErrorKind;
 
 use proto::ErrorCode;
 
@@ -44,7 +44,9 @@ pub enum Error {
     Proto(proto::connection::Error),
     #[error(display = "QUIC protocol error: {}", _0)]
     Quic(quinn::ConnectionError),
-    #[error(display = "QUIC write error: {}", _0)] // TODO to be refined
+    #[error(display = "QUIC read error: {}", _0)]
+    Read(ReadError),
+    #[error(display = "QUIC write error: {}", _0)]
     Write(WriteError),
     #[error(display = "Internal error: {}", _0)]
     Internal(String),
@@ -60,6 +62,8 @@ pub enum Error {
     Poll,
     #[error(display = "Client cancelled request")]
     RequestCancelled,
+    #[error(display = "Server rejected the request")]
+    RequestRejected,
 }
 
 impl Error {
@@ -95,12 +99,29 @@ impl From<quinn::ConnectionError> for Error {
     }
 }
 
+impl From<ErrorCode> for Error {
+    fn from(code: ErrorCode) -> Self {
+        match code {
+            ErrorCode::REQUEST_CANCELLED => Error::RequestCancelled,
+            ErrorCode::REQUEST_REJECTED => Error::RequestRejected,
+            _ => panic!("wut"),
+        }
+    }
+}
+
+impl From<ReadError> for Error {
+    fn from(err: ReadError) -> Error {
+        match err {
+            ReadError::Reset(c) => ErrorCode::from(c).into(),
+            _ => Error::Read(err),
+        }
+    }
+}
+
 impl From<WriteError> for Error {
     fn from(err: WriteError) -> Error {
         match err {
-            WriteError::Stopped(c) if c == ErrorCode::REQUEST_CANCELLED.into() => {
-                Error::RequestCancelled
-            }
+            WriteError::Stopped(c) => ErrorCode::from(c).into(),
             _ => Error::Write(err),
         }
     }
@@ -108,6 +129,14 @@ impl From<WriteError> for Error {
 
 impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Error {
+        if err.kind() == ErrorKind::ConnectionReset && err.get_ref().is_some() {
+            let err = err.into_inner().unwrap();
+            let e = match err.downcast::<ReadError>() {
+                Ok(e) => return (*e).into(),
+                Err(e) => e,
+            };
+            return Error::Io(std::io::Error::new(ErrorKind::ConnectionReset, e));
+        }
         Error::Io(err)
     }
 }
@@ -115,7 +144,7 @@ impl From<std::io::Error> for Error {
 impl From<frame::Error> for Error {
     fn from(err: frame::Error) -> Error {
         match err {
-            frame::Error::Io(e) => Error::Io(e),
+            frame::Error::Io(e) => e.into(),
             e => Error::Peer(format!("received an invalid frame: {:?}", e)),
         }
     }
